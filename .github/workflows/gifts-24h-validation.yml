@@ -1,0 +1,74 @@
+name: Gifts 24h data validation
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/gifts-24h-validation.yml'
+  schedule:
+    - cron: '0 * * * *'
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: gifts-24h-validation
+  cancel-in-progress: false
+jobs:
+  collect:
+    if: github.run_number <= 25
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Enforce fixed 24-hour deadline
+        id: window
+        run: |
+          python3 - <<'PY'
+          import datetime,os
+          deadline=datetime.datetime.fromisoformat("2026-10-05T22:22:14+00:00")
+          active=datetime.datetime.now(datetime.timezone.utc)<deadline
+          with open(os.environ["GITHUB_OUTPUT"],"a") as f:
+              f.write("active="+str(active).lower()+"\n")
+          print("Collection window active:",active,"| Deadline UTC:",deadline.isoformat())
+          PY
+      - uses: actions/checkout@v4
+        if: steps.window.outputs.active == 'true'
+      - name: Restore latest saved market evidence
+        if: steps.window.outputs.active == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          capture_checkpoint=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" --jq '[.artifacts[] | select(.expired == false and (.name == "gifts-validation-checkpoint" or .name == "gifts-market-evidence"))] | sort_by(.created_at) | last | [.workflow_run.id, .name] | @tsv')
+          if [ -z "$capture_checkpoint" ]; then
+            echo "No valid checkpoint found. Stopping instead of resetting history."
+            exit 1
+          fi
+          read -r capture_run capture_name <<< "$capture_checkpoint"
+          gh run download "$capture_run" --repo "$GITHUB_REPOSITORY" --name "$capture_name" --dir capture
+          python3 - <<'PY'
+          import pathlib,sqlite3
+          path=pathlib.Path("capture/market.sqlite")
+          if not path.is_file():
+              raise RuntimeError("Checkpoint database missing")
+          db=sqlite3.connect(path)
+          print("RESTORED_EVENTS:",db.execute("SELECT count(*) FROM events").fetchone()[0])
+          print("RESTORED_SALES:",db.execute("SELECT count(*) FROM events WHERE event='sale'").fetchone()[0])
+          db.close()
+          PY
+      - name: Verify safeguards and install feed client
+        if: steps.window.outputs.active == 'true'
+        run: |
+          python3 -m unittest -v test_guest_pipeline
+          python3 -m pip install --disable-pip-version-check websockets==16.0
+      - name: Collect one-minute sample
+        if: steps.window.outputs.active == 'true'
+        run: timeout 85s python3 -u guest_pipeline.py --seconds 60 --output-dir capture
+      - name: Preserve cumulative checkpoint
+        if: always() && steps.window.outputs.active == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: gifts-validation-checkpoint
+          path: |
+            capture/market.sqlite
+            capture/summary.json
+            capture/assessments.json
+          retention-days: 2
+          if-no-files-found: error
