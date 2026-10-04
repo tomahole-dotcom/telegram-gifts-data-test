@@ -1,0 +1,47 @@
+name: Gifts guest sales feed test
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/gifts-guest-feed-test.yml'
+permissions: {}
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Install WebSocket client
+        run: python3 -m pip install --disable-pip-version-check websockets==16.0
+      - name: Read public guest feed for 35 seconds
+        run: |
+          timeout 55s python3 - <<'PY'
+          import asyncio,json,time
+          import websockets
+          async def main():
+              counts={"sale":0,"listing":0}
+              try:
+                  async with websockets.connect("wss://live.see.tg/v1/ws",open_timeout=10,max_size=1000000) as ws:
+                      print("CONNECTED: guest WebSocket")
+                      await ws.send(json.dumps({"type":"subscribe","events":["sale","listing"]}))
+                      deadline=time.monotonic()+35
+                      while time.monotonic()<deadline:
+                          try:
+                              raw=await asyncio.wait_for(ws.recv(),deadline-time.monotonic())
+                          except asyncio.TimeoutError:
+                              break
+                          d=json.loads(raw)
+                          event=d.get("event")
+                          if event not in counts:
+                              print("CONTROL:",d.get("type"),d.get("error_code"))
+                              continue
+                          counts[event]+=1
+                          if counts[event]<=3:
+                              gift=d.get("gift") or {}
+                              safe={k:d[k] for k in ("type","event","at","market","price","price_ton") if k in d}
+                              safe["gift"]={k:gift[k] for k in ("slug","num","title","model","backdrop","pattern") if k in gift}
+                              print("EVENT:",json.dumps(safe,ensure_ascii=False))
+                      print("COUNTS:",json.dumps(counts))
+              except Exception as e:
+                  print("FAILED:",type(e).__name__,str(e)[:150])
+          asyncio.run(main())
+          PY
