@@ -35,17 +35,27 @@ jobs:
                   headers={"Accept": "application/json", "Content-Type": "application/json"},
                   method=method,
               )
+              details = {}
               try:
                   with urllib.request.urlopen(request, timeout=8) as response:
                       status = response.status
+                      details = {"content_type": response.headers.get("Content-Type", "")}
               except urllib.error.HTTPError as error:
                   status = error.code
+                  body = error.read(4096).decode("utf-8", errors="replace").lower()
+                  details = {
+                      "content_type": error.headers.get("Content-Type", ""),
+                      "server": error.headers.get("Server", ""),
+                      "cf_mitigated": error.headers.get("cf-mitigated", ""),
+                      "challenge_marker": any(word in body for word in ("just a moment", "cf-chl-", "challenge-platform")),
+                      "authentication_marker": any(word in body for word in ("unauthorized", "authentication required", "invalid token", "missing token")),
+                  }
                   error.close()
               except (urllib.error.URLError, OSError):
                   return {"source": "mrkt", "path": path, "reachable": False, "data_validated": False}
               return {"source": "mrkt", "path": path, "http_status": status,
                       "login_required": status == 401, "access_unresolved": status == 403,
-                      "data_validated": False}
+                      "data_validated": False, **details}
 
           with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
               futures = [pool.submit(telegram),
