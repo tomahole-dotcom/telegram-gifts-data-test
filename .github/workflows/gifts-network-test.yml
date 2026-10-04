@@ -1,0 +1,58 @@
+name: Gifts network test
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/gifts-network-test.yml'
+permissions: {}
+jobs:
+  connection-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Check Telegram and MRKT (no login)
+        shell: bash
+        run: |
+          timeout 30s python3 - <<'PY'
+          import concurrent.futures
+          import datetime
+          import json
+          import socket
+          import urllib.error
+          import urllib.request
+
+          def telegram():
+              try:
+                  with socket.create_connection(("149.154.167.51", 443), timeout=8):
+                      return {"source": "telegram_dc_tcp", "reachable": True, "authenticated": False}
+              except OSError:
+                  return {"source": "telegram_dc_tcp", "reachable": False, "authenticated": False}
+
+          def mrkt(path, method):
+              request = urllib.request.Request(
+                  "https://api.tgmrkt.io/api/v1" + path,
+                  data=b"{}" if method == "POST" else None,
+                  headers={"Accept": "application/json", "Content-Type": "application/json"},
+                  method=method,
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=8) as response:
+                      status = response.status
+              except urllib.error.HTTPError as error:
+                  status = error.code
+                  error.close()
+              except (urllib.error.URLError, OSError):
+                  return {"source": "mrkt", "path": path, "reachable": False, "data_validated": False}
+              return {"source": "mrkt", "path": path, "http_status": status,
+                      "login_required": status == 401, "access_unresolved": status == 403,
+                      "data_validated": False}
+
+          with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+              futures = [pool.submit(telegram),
+                         pool.submit(mrkt, "/gifts/collections", "GET"),
+                         pool.submit(mrkt, "/feed", "POST")]
+              results = [future.result() for future in futures]
+          print(json.dumps({"event": "gifts_network_probe",
+                            "observed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                            "results": results}))
+          PY
