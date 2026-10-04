@@ -8,22 +8,23 @@ permissions: {}
 jobs:
   probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 2
+    timeout-minutes: 4
     steps:
       - name: Install WebSocket client
         run: python3 -m pip install --disable-pip-version-check websockets==16.0
-      - name: Read public guest feed for 35 seconds
+      - name: Read public guest feed for 150 seconds
         run: |
-          timeout 55s python3 - <<'PY'
+          timeout 175s python3 -u - <<'PY'
           import asyncio,json,time
           import websockets
           async def main():
+              started=time.monotonic()
               counts={"sale":0,"listing":0}
               try:
                   async with websockets.connect("wss://live.see.tg/v1/ws",open_timeout=10,max_size=1000000) as ws:
                       print("CONNECTED: guest WebSocket")
                       await ws.send(json.dumps({"type":"subscribe","events":["sale","listing"]}))
-                      deadline=time.monotonic()+35
+                      deadline=time.monotonic()+150
                       while time.monotonic()<deadline:
                           try:
                               raw=await asyncio.wait_for(ws.recv(),deadline-time.monotonic())
@@ -40,7 +41,7 @@ jobs:
                               safe={k:d[k] for k in ("type","event","at","market","price","price_ton") if k in d}
                               safe["gift"]={k:gift[k] for k in ("slug","num","title","model","backdrop","pattern") if k in gift}
                               print("EVENT:",json.dumps(safe,ensure_ascii=False))
-                      print("COUNTS:",json.dumps(counts))
+                      print("COUNTS:",json.dumps(counts), "elapsed_seconds:", round(time.monotonic()-started,1))
               except Exception as e:
                   print("FAILED:",type(e).__name__,str(e)[:150])
           asyncio.run(main())
