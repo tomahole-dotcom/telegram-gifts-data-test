@@ -1,0 +1,28 @@
+name: Gifts saved pipeline test
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/gifts-saved-pipeline.yml'
+permissions:
+  contents: read
+jobs:
+  pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify valuation safeguards
+        run: python3 -m unittest -v test_guest_pipeline
+      - name: Install feed client
+        run: python3 -m pip install --disable-pip-version-check websockets==16.0
+      - name: Capture and assess real market events
+        run: timeout 85s python3 -u guest_pipeline.py --seconds 60 --output-dir capture
+      - name: Preserve sanitized events and assessments
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gifts-market-evidence
+          path: capture/
+          retention-days: 7
+          if-no-files-found: error
