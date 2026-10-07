@@ -1,0 +1,32 @@
+name: Gifts destination check
+on:
+  push:
+    paths: ['.github/workflows/gifts-destination-check.yml']
+  workflow_dispatch:
+permissions: {}
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - env:
+          GIFTS_BOT_TOKEN: ${{ secrets.GIFTS_BOT_TOKEN }}
+          GIFTS_ALERT_CHAT_ID: ${{ secrets.GIFTS_ALERT_CHAT_ID }}
+        run: |
+          python - <<'PY'
+          import os,json,urllib.request
+          token=os.environ.get("GIFTS_BOT_TOKEN","").strip()
+          chat=os.environ.get("GIFTS_ALERT_CHAT_ID","").strip()
+          if not token: raise SystemExit("CONFIG_ERROR: bot token missing")
+          for method,payload in [("getMe",{}),("getChat",{"chat_id":chat})]:
+              if method=="getChat" and not chat.lstrip("-").isdigit():
+                  raise SystemExit("CONFIG_ERROR: destination must contain only chat ID digits")
+              try:
+                  req=urllib.request.Request("https://api.telegram.org/bot"+token+"/"+method,data=json.dumps(payload).encode(),headers={"Content-Type":"application/json"})
+                  with urllib.request.urlopen(req,timeout=15) as response: result=json.loads(response.read())
+                  if not result.get("ok"): raise ValueError()
+              except Exception: raise SystemExit("CHECK_FAILED: "+method) from None
+              if method=="getMe" and result["result"].get("username","").lower()!="giftradartombot": raise SystemExit("CHECK_FAILED: wrong bot")
+              if method=="getChat" and result["result"].get("type")!="private": raise SystemExit("CHECK_FAILED: not private")
+              print("CHECK_OK: "+method)
+          PY
