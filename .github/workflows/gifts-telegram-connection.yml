@@ -1,0 +1,63 @@
+name: Gifts Telegram connection test
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/gifts-telegram-connection.yml'
+permissions: {}
+concurrency:
+  group: gifts-telegram-connection
+  cancel-in-progress: false
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Verify dedicated bot and send one private test
+        env:
+          GIFTS_BOT_TOKEN: ${{ secrets.GIFTS_BOT_TOKEN }}
+        run: |
+          python3 - <<'PY'
+          import json,os,time,urllib.request
+          token=os.environ.get("GIFTS_BOT_TOKEN","").strip()
+          def call(method,payload):
+              request=urllib.request.Request("https://api.telegram.org/bot"+token+"/"+method,
+                  data=json.dumps(payload).encode(),headers={"Content-Type":"application/json"},method="POST")
+              try:
+                  with urllib.request.urlopen(request,timeout=15) as response:
+                      data=json.loads(response.read(500000))
+                  if not data.get("ok"):
+                      raise RuntimeError()
+                  return data["result"]
+              except Exception:
+                  raise RuntimeError("Telegram request failed; no automatic resend.") from None
+          try:
+              if not token:
+                  raise RuntimeError("GIFTS_BOT_TOKEN is missing.")
+              bot=call("getMe",{})
+              if bot.get("username","").lower()!="giftradartombot":
+                  raise RuntimeError("Token belongs to a different bot. Stopping.")
+              print("BOT_VERIFIED: GiftRadarTomBot",flush=True)
+              updates=call("getUpdates",{"timeout":0,"allowed_updates":["message"]})
+              chats={}
+              for update in updates:
+                  message=update.get("message",{})
+                  chat=message.get("chat",{})
+                  if chat.get("type")=="private" and message.get("text","").split(" ")[0]=="/start":
+                      if 0<=time.time()-message.get("date",0)<=86400:
+                          chats[chat["id"]]=message.get("date",0)
+              if len(chats)!=1:
+                  raise RuntimeError("Expected one recent private Start message; found "+str(len(chats))+".")
+              chat_id=next(iter(chats))
+              # Chat ID is delivered privately, never logged or uploaded as an artifact.
+              text=("🎁 GiftRadar er koblet til Telegram.\n\n"
+                    "Dette er en tilkoblingstest, ikke et opportunity-alert.\n"
+                    "Ingen kjøp er gjort.\n\n"
+                    "Din chat-ID for oppsettet:\n"+str(chat_id))
+              sent=call("sendMessage",{"chat_id":chat_id,"text":text,"link_preview_options":{"is_disabled":True}})
+              print("TEST_MESSAGE_SENT: true",flush=True)
+          except Exception as error:
+              print("SETUP_STATUS:",str(error),flush=True)
+              raise SystemExit(1)
+          
+          PY
