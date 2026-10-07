@@ -1,0 +1,96 @@
+name: Gifts market report
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/gifts-market-report.yml'
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: gifts-market-report
+  cancel-in-progress: false
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore most recent market evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p capture
+          checkpoint=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" --jq '[.artifacts[] | select(.expired == false and (.name == "gifts-validation-checkpoint" or .name == "gifts-market-evidence" or .name == "gifts-report-evidence"))] | sort_by(.created_at) | last | [.workflow_run.id,.name] | @tsv')
+          if [ -n "$checkpoint" ]; then
+            read -r source_run source_name <<< "$checkpoint"
+            gh run download "$source_run" --repo "$GITHUB_REPOSITORY" --name "$source_name" --dir capture
+            echo "EVIDENCE_RESTORED: true"
+          else
+            echo "EVIDENCE_RESTORED: false; fresh sample will be labelled"
+          fi
+      - name: Test pipeline and alert guards
+        run: python -m unittest test_guest_pipeline test_telegram_alerts
+      - name: Capture current market sample
+        run: |
+          pip -q install websockets==16.0
+          python guest_pipeline.py --seconds 60 --output-dir capture
+      - name: Send actual market report to dedicated private chat
+        env:
+          GIFTS_BOT_TOKEN: ${{ secrets.GIFTS_BOT_TOKEN }}
+          GIFTS_ALERT_CHAT_ID: ${{ secrets.GIFTS_ALERT_CHAT_ID }}
+        run: |
+          python - <<'PY'
+          import json,os,sqlite3,urllib.request
+          from pathlib import Path
+          from telegram_alerts import telegram_send
+          token=os.environ.get("GIFTS_BOT_TOKEN")
+          chat=os.environ.get("GIFTS_ALERT_CHAT_ID")
+          if not token or not chat:
+              raise SystemExit("SETUP_ERROR: dedicated bot or destination secret missing")
+          def call(method,payload):
+              try:
+                  req=urllib.request.Request("https://api.telegram.org/bot"+token+"/"+method,data=json.dumps(payload).encode(),headers={"Content-Type":"application/json"})
+                  with urllib.request.urlopen(req,timeout=15) as response:
+                      result=json.loads(response.read(100000))
+                  if not result.get("ok"): raise ValueError()
+                  return result["result"]
+              except Exception:
+                  raise SystemExit("SETUP_ERROR: Telegram verification failed") from None
+          me=call("getMe",{})
+          if me.get("username","").lower()!="giftradartombot":
+              raise SystemExit("SETUP_ERROR: unexpected bot")
+          destination=call("getChat",{"chat_id":chat})
+          if destination.get("type")!="private":
+              raise SystemExit("SETUP_ERROR: private destination required")
+          summary=json.loads(Path("capture/summary.json").read_text())
+          db=sqlite3.connect("capture/market.sqlite")
+          timestamps=db.execute("SELECT min(observed),max(observed) FROM events").fetchone()
+          from datetime import datetime,timezone
+          fmt=lambda t: datetime.fromtimestamp(t,timezone.utc).strftime("%Y-%m-%d %H:%M UTC") if t else "ukjent"
+          events=summary["events"]
+          text=("🎁 GiftRadar — faktisk markedsrapport\n\n"
+                "Dette er en datatest, ikke et kjøpssignal.\n"
+                "Kilde: see.tg, mottatte markedsmeldinger.\n"
+                f"Første/siste observasjon: {fmt(timestamps[0])} / {fmt(timestamps[1])}\n"
+                "Innsamlingen er i korte vinduer, ikke sammenhengende.\n\n"
+                f"Listings: {events.get('listing',0)}\n"
+                f"Prisendringer: {events.get('price',0)}\n"
+                f"Rapporterte salg: {events.get('sale',0)}\n"
+                f"Vurderinger: {summary['assessments']}\n"
+                f"Forskningskandidater: {summary['research_candidates']}\n"
+                "Validerte opportunity-alerts: 0\n\n"
+                "Verdsettelsen krever minst fem tidligere salg av andre gifts med samme traits i TON. "
+                "Tilgjengelighet og kostnader må også verifiseres før kjøpssignal. Ingen kjøp er gjort.")
+          Path("capture/report.json").write_text(json.dumps({"summary":summary,"first_observed":timestamps[0],"last_observed":timestamps[1],"continuous_capture":False},indent=2))
+          telegram_send(token,chat,text)
+          print("BOT_VERIFIED: GiftRadarTomBot")
+          print("MARKET_REPORT_SENT: true")
+          print("REPORT_SUMMARY:",json.dumps(summary))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gifts-report-evidence
+          path: capture/
+          retention-days: 14
