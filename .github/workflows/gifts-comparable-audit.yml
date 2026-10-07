@@ -1,0 +1,80 @@
+name: Gifts comparable coverage audit
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/gifts-comparable-audit.yml'
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: gifts-comparable-audit
+  cancel-in-progress: false
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore most recent market evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p capture
+          checkpoint=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" --jq '[.artifacts[] | select(.expired == false and (.name == "gifts-validation-checkpoint" or .name == "gifts-market-evidence" or .name == "gifts-report-evidence"))] | sort_by(.created_at) | last | [.workflow_run.id,.name] | @tsv')
+          if [ -n "$checkpoint" ]; then
+            read -r source_run source_name <<< "$checkpoint"
+            gh run download "$source_run" --repo "$GITHUB_REPOSITORY" --name "$source_name" --dir capture
+            echo "EVIDENCE_RESTORED: true"
+          else
+            echo "EVIDENCE_RESTORED: false; fresh sample will be labelled"
+          fi
+      - name: Audit actual comparable coverage without changing valuation
+        run: |
+          python - <<'PY'
+          import json,sqlite3
+          from pathlib import Path
+          from collections import Counter
+          from statistics import median
+          path=Path("capture/market.sqlite")
+          if not path.exists(): raise SystemExit("No preserved market evidence; no result fabricated")
+          db=sqlite3.connect(path)
+          events=[json.loads(r[0]) for r in db.execute("SELECT payload FROM events")]
+          sales=[e for e in events if e["event"]=="sale" and e.get("price_ton") is not None]
+          listings=[e for e in events if e["event"] in ("listing","price") and e.get("price_ton") is not None]
+          levels={"exact":("slug","model","backdrop","pattern"),"model_backdrop":("slug","model","backdrop"),"model":("slug","model")}
+          report={"sales_ton":len(sales),"listing_or_price_events_ton":len(listings),"levels":{},"method":"Only prior sales received before each event; unique other gifts; 7-day window. Broader groups are coverage diagnostics, not fair value or buy signals."}
+          def key(e,fields):
+              g=e["gift"]
+              return tuple(g.get(f) for f in fields) if all(g.get(f) for f in fields) else None
+          for level,fields in levels.items():
+              counts=[]
+              for listing in listings:
+                  k=key(listing,fields)
+                  others={}
+                  if k:
+                      for s in sorted(sales,key=lambda e:e["at"]):
+                          if key(s,fields)==k and s["gift"]["num"]!=listing["gift"]["num"] and listing["at"]-604800<=s["at"]<=listing["at"] and s["observed_at"]<=listing["observed_at"]:
+                              others[(s["gift"]["slug"],s["gift"]["num"])]=s
+                  counts.append(len(others))
+              errors=[]
+              for target in sales:
+                  k=key(target,fields)
+                  earlier={}
+                  if k:
+                      for s in sorted(sales,key=lambda e:e["at"]):
+                          if key(s,fields)==k and s["gift"]["num"]!=target["gift"]["num"] and target["at"]-604800<=s["at"]<target["at"] and s["observed_at"]<=target["observed_at"]:
+                              earlier[(s["gift"]["slug"],s["gift"]["num"])]=s
+                  if len(earlier)>=5:
+                      estimate=median(s["price_ton"] for s in earlier.values())
+                      errors.append(abs(estimate-target["price_ton"])/target["price_ton"])
+              report["levels"][level]={"events_with_5_prior_other_sales":sum(n>=5 for n in counts),"max_comparables":max(counts,default=0),"sale_prediction_samples":len(errors),"median_absolute_percentage_error":median(errors) if errors else None}
+          Path("capture/coverage-audit.json").write_text(json.dumps(report,indent=2))
+          print("COVERAGE_AUDIT:",json.dumps(report))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: gifts-coverage-evidence
+          path: capture/
+          retention-days: 14
