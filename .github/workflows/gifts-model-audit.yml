@@ -1,0 +1,58 @@
+name: Gifts model error audit
+on:
+  push:
+    paths: ['.github/workflows/gifts-model-audit.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Restore completed hour of evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run download 37692962920 --repo "$GITHUB_REPOSITORY" --name gifts-continuous-evidence --dir capture
+          test -f capture/market.sqlite
+      - name: Measure historical errors by collection and model
+        run: |
+          python - <<'PY'
+          import json,sqlite3,math
+          from collections import defaultdict
+          from statistics import median
+          from pathlib import Path
+          db=sqlite3.connect("capture/market.sqlite")
+          sales=[json.loads(r[0]) for r in db.execute("SELECT payload FROM events WHERE event='sale'")]
+          sales=[s for s in sales if s.get("price_ton")]
+          groups=defaultdict(list)
+          rows=[]
+          for target in sorted(sales,key=lambda s:s["observed_at"]):
+              g=target["gift"]
+              key=(g.get("slug"),g.get("model"))
+              if not all(key): continue
+              previous={}
+              for s in sorted(groups[key],key=lambda s:s["at"]):
+                  if target["at"]-604800<=s["at"]<target["at"] and s["gift"]["num"]!=g["num"]:
+                      previous[s["gift"]["num"]]=s
+              if len(previous)>=5:
+                  fair=median(s["price_ton"] for s in previous.values())
+                  rows.append({"collection":key[0],"model":key[1],"number":g["num"],"actual_ton":target["price_ton"],"estimate_ton":fair,"absolute_error_pct":100*abs(fair/target["price_ton"]-1),"overestimated":fair>target["price_ton"],"comps":len(previous)})
+              groups[key].append(target)
+          def stats(rs):
+              values=sorted(r["absolute_error_pct"] for r in rs)
+              return {"samples":len(rs),"median_error_pct":median(values) if values else None,"p90_error_pct":values[max(0,math.ceil(.9*len(values))-1)] if values else None,"max_error_pct":max(values,default=None),"overestimate_over_15pct":sum(r["estimate_ton"]>r["actual_ton"]*1.15 for r in rs)}
+          by=defaultdict(list)
+          for r in rows: by[(r["collection"],r["model"])].append(r)
+          report={"total":stats(rows),"groups":[{"collection":k[0],"model":k[1],**stats(v)} for k,v in by.items()],"ordinary_serials":stats([r for r in rows if r["number"]>1000]),"warning":"Historical sale-price error only; sparse sample, mixed traits, no executable profit or liquidity validation.","worst_cases":sorted(rows,key=lambda r:r["absolute_error_pct"],reverse=True)[:5]}
+          Path("capture/model-error-audit.json").write_text(json.dumps(report,indent=2))
+          print("MODEL_ERROR_AUDIT:",json.dumps(report))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: gifts-model-audit-evidence
+          path: capture/
+          retention-days: 30
