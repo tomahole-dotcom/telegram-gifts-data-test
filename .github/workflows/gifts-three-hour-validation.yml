@@ -1,0 +1,98 @@
+name: Gifts bounded three hour validation
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/gifts-three-hour-validation.yml'
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: gifts-three-hour-validation
+  cancel-in-progress: false
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 190
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore most recent market evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p capture
+          checkpoint=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" --jq '[.artifacts[] | select(.expired == false and (.name == "gifts-validation-checkpoint" or .name == "gifts-market-evidence" or .name == "gifts-report-evidence" or .name == "gifts-coverage-evidence" or .name == "gifts-continuous-evidence"))] | sort_by(.created_at) | last | [.workflow_run.id,.name] | @tsv')
+          if [ -n "$checkpoint" ]; then
+            read -r source_run source_name <<< "$checkpoint"
+            gh run download "$source_run" --repo "$GITHUB_REPOSITORY" --name "$source_name" --dir capture
+            echo "EVIDENCE_RESTORED: true"
+          else
+            echo "EVIDENCE_RESTORED: false; fresh sample will be labelled"
+          fi
+      - name: Verify existing pipeline
+        run: python -m unittest test_guest_pipeline test_telegram_alerts
+      - name: Observe three hours with recorded connection gaps
+        run: |
+          pip -q install websockets==16.0
+          python - <<'PY'
+          import asyncio,json,time
+          from pathlib import Path
+          import guest_pipeline as pipeline
+          directory=Path("capture")
+          original=pipeline.export
+          last_export=0
+          cached={}
+          def throttled(db,path,counters):
+              global last_export,cached
+              if time.monotonic()-last_export>=60 or not cached:
+                  cached=original(db,path,counters)
+                  last_export=time.monotonic()
+              return cached
+          pipeline.export=throttled
+          async def run():
+              start=time.time()
+              deadline=time.monotonic()+10800
+              attempts=[]
+              while time.monotonic()<deadline:
+                  began=time.time()
+                  outcome="completed"
+                  try:
+                      await pipeline.capture(max(1,int(deadline-time.monotonic())),directory)
+                  except Exception:
+                      outcome="disconnected"
+                  attempts.append({"started":began,"ended":time.time(),"outcome":outcome})
+                  Path("capture/connection-windows.json").write_text(json.dumps({"started":start,"attempts":attempts,"requested_seconds":10800,"replay_available":False},indent=2))
+                  print("CONNECTION_WINDOW:",json.dumps(attempts[-1]),flush=True)
+                  if outcome=="disconnected":
+                      await asyncio.sleep(min(5,max(0,deadline-time.monotonic())))
+              db=pipeline.database(directory/"market.sqlite")
+              print("FINAL_SUMMARY:",json.dumps(original(db,directory,{})),flush=True)
+              db.close()
+          asyncio.run(run())
+          PY
+      - name: Report recent sales depth
+        run: |
+          python - <<'PY'
+          import json,sqlite3,time
+          from pathlib import Path
+          from collections import defaultdict
+          db=sqlite3.connect("capture/market.sqlite")
+          groups=defaultdict(set)
+          recent=0
+          for payload, in db.execute("SELECT payload FROM events WHERE event='sale' AND at>=?",(time.time()-604800,)):
+              s=json.loads(payload)
+              g=s["gift"]
+              if not s.get("price_ton"): continue
+              recent+=1
+              if all(g.get(k) for k in ("slug","model","backdrop","pattern")):
+                  groups[(g["slug"],g["model"],g["backdrop"],g["pattern"])].add(g["num"])
+          report={"recent_ton_sale_events":recent,"exact_trait_groups_with_5_other_assets":sum(len(v)>=6 for v in groups.values()),"largest_exact_trait_group":max((len(v) for v in groups.values()),default=0),"alerts_sent":0,"note":"Depth diagnostic only; not valuation or proof of profit."}
+          Path("capture/recent-depth.json").write_text(json.dumps(report,indent=2))
+          print("RECENT_DEPTH:",json.dumps(report))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gifts-three-hour-evidence
+          path: capture/
+          retention-days: 30
