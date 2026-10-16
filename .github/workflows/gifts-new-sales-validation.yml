@@ -44,7 +44,7 @@ jobs:
           for sale in actual:
               buckets[(sale["gift"].get("slug"),sale["gift"].get("model"))].append(sale)
           # Score only Oct 15 evidence, collected after research rules were committed.
-          actual=[s for s in actual if s["at"]>=1792086910]
+          actual=[s for s in actual if s["at"]>=1792076880]
           overestimates=0
           for target in actual:
               result=estimate(target,buckets[(target["gift"].get("slug"),target["gift"].get("model"))])
