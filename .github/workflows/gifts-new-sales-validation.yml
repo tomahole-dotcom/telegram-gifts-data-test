@@ -1,0 +1,66 @@
+name: Gifts new sales validation
+on:
+  push:
+    paths: ['.github/workflows/gifts-new-sales-validation.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore completed hour of evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run download 38757593364 --repo "$GITHUB_REPOSITORY" --name gifts-three-hour-evidence --dir capture
+          test -f capture/market.sqlite
+      - name: Verify abstention and historical evidence
+        run: |
+          python - <<'PY'
+          import json,sqlite3
+          from pathlib import Path
+          from statistics import median
+          from trait_research import estimate
+          def event(n,at,backdrop="Blue",pattern="Star"):
+              return {"id":str(n),"at":at,"observed_at":at,"price_ton":10,"gift":{"slug":"Fixture","model":"A","backdrop":backdrop,"pattern":pattern,"num":n}}
+          target=event(2000,100)
+          sales=[event(n,10+n-3000) for n in range(3000,3005)]
+          assert estimate(target,sales)["status"]=="RESEARCH_ESTIMATE"
+          assert estimate(target,sales)["alert_eligible"] is False
+          assert estimate(target,sales[:4])["status"]=="ABSTAIN"
+          assert estimate(target,[dict(s,observed_at=101) for s in sales])["status"]=="ABSTAIN"
+          assert estimate(target,[event(n,20,"Red","Moon") for n in range(3000,3005)])["status"]=="ABSTAIN"
+          db=sqlite3.connect("capture/market.sqlite")
+          actual=[json.loads(r[0]) for r in db.execute("SELECT payload FROM events WHERE event='sale'")]
+          actual=[s for s in actual if s.get("price_ton")]
+          errors=[]
+          holds={}
+          from collections import defaultdict
+          buckets=defaultdict(list)
+          for sale in actual:
+              buckets[(sale["gift"].get("slug"),sale["gift"].get("model"))].append(sale)
+          # Score only Oct 15 evidence, collected after research rules were committed.
+          actual=[s for s in actual if s["at"]>=1792086910]
+          overestimates=0
+          for target in actual:
+              result=estimate(target,buckets[(target["gift"].get("slug"),target["gift"].get("model"))])
+              if result["status"]=="RESEARCH_ESTIMATE" and result["estimated_value_ton"]>target["price_ton"]*1.15:
+                  overestimates+=1
+              if result["status"]=="RESEARCH_ESTIMATE":
+                  errors.append(abs(result["estimated_value_ton"]/target["price_ton"]-1)*100)
+              else:
+                  for reason in result["reasons"]: holds[reason]=holds.get(reason,0)+1
+          report={"sales":len(actual),"estimates":len(errors),"abstentions":len(actual)-len(errors),"median_error_pct":median(errors) if errors else None,"max_error_pct":max(errors,default=None),"holds":holds,"overestimates_above_15pct":overestimates,"alerts_sent":0,"validation":"Frozen experimental rules applied to subsequently collected sale events; sale price estimation only, not profit or execution validation"}
+          Path("capture/trait-validation.json").write_text(json.dumps(report,indent=2))
+          print("TRAIT_VALIDATION:",json.dumps(report))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: gifts-new-sales-evidence
+          path: capture/
+          retention-days: 30
