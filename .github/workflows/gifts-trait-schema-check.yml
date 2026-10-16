@@ -19,6 +19,9 @@ jobs:
           from collections import Counter,defaultdict
           db=sqlite3.connect("capture/market.sqlite")
           sales=[json.loads(r[0]) for r in db.execute("SELECT payload FROM events WHERE event='sale' AND at>=1792076880")]
+          signatures=Counter((s["gift"]["slug"],s["gift"]["num"],s.get("market"),s.get("price_ton")) for s in sales)
+          unique_assets={(s["gift"]["slug"],s["gift"]["num"]) for s in sales}
+          print("SALE_IDENTITY:",json.dumps({"sale_events":len(sales),"unique_assets":len(unique_assets),"unique_asset_market_price":len(signatures),"repeated_asset_market_price_events":sum(n-1 for n in signatures.values()),"most_repeated":[{"asset":k[:2],"market":k[2],"price":k[3],"events":n} for k,n in signatures.most_common(5)]}))
           groups=defaultdict(list)
           for s in sales:
               g=s["gift"]
