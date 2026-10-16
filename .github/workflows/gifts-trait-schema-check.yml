@@ -1,0 +1,28 @@
+name: Gifts trait schema diagnosis
+on:
+  push:
+    paths: ['.github/workflows/gifts-trait-schema-check.yml']
+  workflow_dispatch:
+permissions:
+  actions: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run download 38757593364 --repo "$GITHUB_REPOSITORY" --name gifts-three-hour-evidence --dir capture
+      - run: |
+          python - <<'PY'
+          import sqlite3,json
+          from collections import Counter,defaultdict
+          db=sqlite3.connect("capture/market.sqlite")
+          sales=[json.loads(r[0]) for r in db.execute("SELECT payload FROM events WHERE event='sale' AND at>=1792076880")]
+          groups=defaultdict(list)
+          for s in sales:
+              g=s["gift"]
+              groups[(g.get("slug"),g.get("model"))].append(g)
+          print("TRAIT_SAMPLES:",json.dumps([s["gift"] for s in sales[:5]]))
+          print("GROUP_DIAGNOSIS:",json.dumps([{"group":k,"sales":len(v),"backdrops":Counter(str(g.get("backdrop")) for g in v).most_common(3),"patterns":Counter(str(g.get("pattern")) for g in v).most_common(3)} for k,v in sorted(groups.items(),key=lambda kv:len(kv[1]),reverse=True)[:5]]))
+          PY
