@@ -1,0 +1,68 @@
+name: Gifts feed integrity diagnosis
+on:
+  push:
+    paths: ['.github/workflows/gifts-feed-integrity.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run download 38757593364 --repo "$GITHUB_REPOSITORY" --name gifts-three-hour-evidence --dir capture
+      - run: |
+          python - <<'PY'
+          import sqlite3,json
+          from collections import Counter,defaultdict
+          db=sqlite3.connect("capture/market.sqlite")
+          sales=[json.loads(r[0]) for r in db.execute("SELECT payload FROM events WHERE event='sale' AND at>=1792076880")]
+          signatures=Counter((s["gift"]["slug"],s["gift"]["num"],s.get("market"),s.get("price_ton")) for s in sales)
+          unique_assets={(s["gift"]["slug"],s["gift"]["num"]) for s in sales}
+          print("SALE_IDENTITY:",json.dumps({"sale_events":len(sales),"unique_assets":len(unique_assets),"unique_asset_market_price":len(signatures),"repeated_asset_market_price_events":sum(n-1 for n in signatures.values()),"most_repeated":[{"asset":k[:2],"market":k[2],"price":k[3],"events":n} for k,n in signatures.most_common(5)]}))
+          by=defaultdict(list)
+          for s in sales:
+              by[(s["gift"]["slug"],s["gift"]["num"],s.get("market"),s.get("price_ton"))].append(s)
+          repeated=sorted(by.values(),key=len,reverse=True)
+          print("REPEAT_TIMELINE:",json.dumps([{"gift":v[0]["gift"],"events":len(v),"distinct_source_times":len({s["at"] for s in v}),"first_times":[{"source_at":s["at"],"received_at":s["observed_at"]} for s in sorted(v,key=lambda e:e["observed_at"])[:4]]} for v in repeated[:3]]))
+          windows=json.loads(open("capture/connection-windows.json").read())["attempts"]
+          print("CONNECTION_HISTORY:",json.dumps({"attempts":len(windows),"disconnects":sum(w["outcome"]=="disconnected" for w in windows),"note":"Prior capture swallowed exception details; cause cannot be recovered from outcome alone."}))
+          import time
+          from guest_pipeline import assess
+          timings=[]
+          for payload, in db.execute("SELECT payload FROM events WHERE event='listing' ORDER BY observed DESC LIMIT 5"):
+              started=time.perf_counter()
+              assess(db,json.loads(payload))
+              timings.append(round(time.perf_counter()-started,4))
+          print("ASSESSMENT_SECONDS:",json.dumps(timings))
+          PY
+      - name: Isolated feed health without valuation workload
+        run: |
+          pip -q install websockets==16.0
+          python - <<'PY'
+          import asyncio,json,time
+          import websockets
+          async def run():
+              count=0
+              started=time.monotonic()
+              try:
+                  async with websockets.connect("wss://live.see.tg/v1/ws",open_timeout=10,max_size=1000000) as ws:
+                      await ws.send(json.dumps({"type":"subscribe","events":["sale","listing","price","delisting"]}))
+                      deadline=time.monotonic()+30
+                      while time.monotonic()<deadline:
+                          try: await asyncio.wait_for(ws.recv(),max(.01,deadline-time.monotonic()))
+                          except asyncio.TimeoutError: break
+                          count+=1
+                  outcome="completed"
+                  code=None
+              except Exception as exc:
+                  outcome=type(exc).__name__
+                  frame=getattr(exc,"rcvd",None)
+                  code=getattr(frame,"code",None)
+              print("ISOLATED_FEED_HEALTH:",json.dumps({"seconds":round(time.monotonic()-started,2),"messages":count,"outcome":outcome,"close_code":code,"note":"Short diagnostic sample, not long-term uptime validation"}))
+          asyncio.run(run())
+          PY
