@@ -1,0 +1,36 @@
+name: Gifts isolated intake one hour
+on:
+  push:
+    paths: ['.github/workflows/gifts-intake-one-hour.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    steps:
+      - uses: actions/checkout@v4
+      - run: python -m unittest test_guest_pipeline test_telegram_alerts
+      - run: pip -q install websockets==16.0
+      - run: python capture_feed.py --seconds 3600
+      - name: Verify persisted evidence and intake boundaries
+        run: |
+          python - <<'PY'
+          import json,sqlite3
+          from pathlib import Path
+          report=json.loads(Path("intake/intake-health.json").read_text())
+          db=sqlite3.connect("intake/market.sqlite")
+          count=db.execute("SELECT count(*) FROM events").fetchone()[0]
+          assert count>0, "No market evidence received"
+          assert db.execute("SELECT count(*) FROM assessments").fetchone()[0]==0
+          assert report["alerts_sent"]==0
+          assert count==sum(report["counts"].get(k,0) for k in ("sale","listing","price","delisting"))
+          print("PERSISTENCE_CHECK: passed; events:",count)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gifts-isolated-hour-evidence
+          path: intake/
+          retention-days: 30
