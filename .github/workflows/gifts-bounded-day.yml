@@ -1,0 +1,80 @@
+name: Gifts bounded day of history
+on:
+  push:
+    paths: ['.github/workflows/gifts-bounded-day.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: gifts-bounded-history
+  cancel-in-progress: false
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 190
+    strategy:
+      fail-fast: true
+      max-parallel: 1
+      matrix:
+        segment: [1,2,3,4,5,6,7,8]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore accumulated history
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          checkpoint=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" --jq '[.artifacts[] | select(.expired == false and (.name | startswith("gifts-day-checkpoint-")))] | sort_by(.created_at) | last | [.workflow_run.id,.name] | @tsv')
+          if [ -n "$checkpoint" ]; then
+            read -r source_run source_name <<< "$checkpoint"
+            gh run download "$source_run" --repo "$GITHUB_REPOSITORY" --name "$source_name" --dir intake
+          else
+            gh run download 39015329315 --repo "$GITHUB_REPOSITORY" --name gifts-isolated-hour-evidence --dir intake
+          fi
+          test -f intake/market.sqlite
+          python - <<'PY'
+          import sqlite3
+          db=sqlite3.connect("intake/market.sqlite")
+          assert db.execute("PRAGMA quick_check").fetchone()[0]=="ok"
+          print("RESTORED_EVENTS:",db.execute("SELECT count(*) FROM events").fetchone()[0])
+          PY
+      - name: Regression checks
+        run: python -m unittest test_guest_pipeline test_telegram_alerts
+      - run: pip -q install websockets==16.0
+      - name: Record three hours without valuation workload
+        run: python capture_feed.py --seconds 10800 --output-dir intake
+      - name: Preserve health and report comparable depth
+        if: always()
+        run: |
+          python - <<'PY'
+          import json,sqlite3,time,os
+          from pathlib import Path
+          from collections import defaultdict
+          path=Path("intake/market.sqlite")
+          if not path.exists(): raise SystemExit("History restore failed; no empty checkpoint published")
+          db=sqlite3.connect(path)
+          assert db.execute("PRAGMA quick_check").fetchone()[0]=="ok"
+          report={"events":dict(db.execute("SELECT event,count(*) FROM events GROUP BY event")),"alerts_sent":0}
+          groups=defaultdict(set)
+          for payload, in db.execute("SELECT payload FROM events WHERE event='sale' AND at>=?",(time.time()-604800,)):
+              s=json.loads(payload)
+              if not s.get("price_ton"): continue
+              g=s["gift"]
+              if all(g.get(k) for k in ("slug","model","backdrop","pattern")):
+                  groups[(g["slug"],g["model"],g["backdrop"],g["pattern"])].add(g["num"])
+          report["exact_trait_groups_with_6_distinct_gifts"]=sum(len(v)>=6 for v in groups.values())
+          report["largest_exact_trait_group"]=max((len(v) for v in groups.values()),default=0)
+          report["note"]="Depth only, not verified sales, fair value, executable opportunity or profit. Segment boundaries and reconnects can leave gaps."
+          Path("intake/depth-summary.json").write_text(json.dumps(report,indent=2))
+          health=Path("intake/intake-health.json")
+          if health.exists():
+              Path("intake/health-"+os.environ["GITHUB_RUN_ID"]+"-"+str(time.time_ns())+".json").write_text(health.read_text())
+          print("HISTORY_DEPTH:",json.dumps(report))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gifts-day-checkpoint-${{ github.run_id }}-${{ matrix.segment }}
+          path: intake/
+          if-no-files-found: error
+          retention-days: 14
