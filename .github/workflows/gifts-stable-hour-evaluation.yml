@@ -1,0 +1,56 @@
+name: Gifts stable hour evaluation
+on:
+  push:
+    paths: ['.github/workflows/gifts-stable-hour-evaluation.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run download 39015329315 --repo "$GITHUB_REPOSITORY" --name gifts-isolated-hour-evidence --dir evidence/new
+          gh run download 38757593364 --repo "$GITHUB_REPOSITORY" --name gifts-three-hour-evidence --dir evidence/prior
+      - run: |
+          python - <<'PY'
+          import json,sqlite3
+          from pathlib import Path
+          from collections import defaultdict,Counter
+          from statistics import median
+          from trait_research import estimate
+          buckets=defaultdict(list)
+          all_sales={}
+          for name in ("prior","new"):
+              db=sqlite3.connect("evidence/"+name+"/market.sqlite")
+              sales=[json.loads(r[0]) for r in db.execute("SELECT payload FROM events WHERE event='sale'")]
+              db.close()
+              for s in sales: all_sales.setdefault(s["id"],s)
+              if name=="new": targets=sales
+          for s in all_sales.values():
+              buckets[(s["gift"].get("slug"),s["gift"].get("model"))].append(s)
+          holds=Counter()
+          predictions=[]
+          for target in targets:
+              if target.get("price_ton") is None: continue
+              result=estimate(target,buckets[(target["gift"].get("slug"),target["gift"].get("model"))])
+              if result["status"]=="RESEARCH_ESTIMATE":
+                  predictions.append({"event_id":target["id"],"gift":target["gift"],"actual":target["price_ton"],"estimate":result["estimated_value_ton"],"error_pct":100*abs(result["estimated_value_ton"]/target["price_ton"]-1)})
+              else: holds.update(result["reasons"])
+          unique={(s["gift"]["slug"],s["gift"]["num"]) for s in targets}
+          signatures={(s["gift"]["slug"],s["gift"]["num"],s.get("market"),s.get("price_ton")) for s in targets}
+          report={"new_sale_events":len(targets),"unique_gifts":len(unique),"unique_gift_market_price":len(signatures),"research_estimates":len(predictions),"median_error_pct":median(p["error_pct"] for p in predictions) if predictions else None,"max_error_pct":max((p["error_pct"] for p in predictions),default=None),"holds":dict(holds),"alerts_sent":0,"note":"Provider-reported sales; no profit validation, no missing-window replay, no real-time deployment."}
+          Path("evidence/stable-hour-evaluation.json").write_text(json.dumps({"summary":report,"predictions":predictions},indent=2))
+          print("STABLE_HOUR_EVALUATION:",json.dumps(report))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: gifts-stable-hour-evaluation
+          path: evidence/
+          retention-days: 30
