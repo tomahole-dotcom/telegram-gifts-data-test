@@ -24,7 +24,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          checkpoint=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" --jq '[.artifacts[] | select(.expired == false and (.name | startswith("gifts-day-checkpoint-")))] | sort_by(.created_at) | last | [.workflow_run.id,.name] | @tsv')
+          checkpoint=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" --jq '[.artifacts[] | select(.expired == false and (.name | startswith("gifts-day-checkpoint-")))] | sort_by(.created_at) | if length == 0 then empty else .[-1] | [.workflow_run.id,.name] | @tsv end')
           if [ -n "$checkpoint" ]; then
             read -r source_run source_name <<< "$checkpoint"
             gh run download "$source_run" --repo "$GITHUB_REPOSITORY" --name "$source_name" --dir intake
