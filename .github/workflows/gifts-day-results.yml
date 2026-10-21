@@ -1,0 +1,79 @@
+name: Gifts day results
+on:
+  workflow_run:
+    workflows: ['Gifts bounded day of history']
+    types: [completed]
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  evaluate:
+    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.head_repository.full_name == github.repository && github.event.workflow_run.head_branch == 'main')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore latest actual checkpoint
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN: ${{ github.event.workflow_run.id }}
+        run: |
+          source_id="${SOURCE_RUN:-39629099901}"
+          checkpoint=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$source_id/artifacts?per_page=100" --jq '[.artifacts[] | select(.expired == false and (.name | startswith("gifts-day-checkpoint-")))] | sort_by(.created_at) | if length==0 then empty else .[-1].name end')
+          test -n "$checkpoint"
+          gh run download "$source_id" --repo "$GITHUB_REPOSITORY" --name "$checkpoint" --dir intake
+      - name: Evaluate frozen estimator and actual coverage
+        run: |
+          python - <<'PY'
+          import json,sqlite3,math
+          from collections import Counter,defaultdict
+          from pathlib import Path
+          from statistics import median
+          from trait_research import estimate
+          db=sqlite3.connect("intake/market.sqlite")
+          sales=[json.loads(r[0]) for r in db.execute("SELECT payload FROM events WHERE event='sale' ORDER BY observed")]
+          sales=[s for s in sales if s.get("price_ton") is not None]
+          buckets=defaultdict(list)
+          holds=Counter()
+          errors=[]
+          over=0
+          seen=set()
+          for s in sales:
+              g=s["gift"]
+              bucket=buckets[(g.get("slug"),g.get("model"))]
+              asset=(g["slug"],g["num"])
+              # Evaluate only the first observed sale per gift to avoid repeat-target inflation.
+              if asset not in seen:
+                  result=estimate(s,bucket)
+                  if result["status"]=="RESEARCH_ESTIMATE":
+                      value=result["estimated_value_ton"]
+                      errors.append(100*abs(value/s["price_ton"]-1))
+                      over+=value>s["price_ton"]*1.15
+                  else: holds.update(result["reasons"])
+                  seen.add(asset)
+              bucket.append(s)
+          histories=[]
+          for path in sorted(Path("intake").glob("health-*.json")):
+              h=json.loads(path.read_text())
+              histories.append({"started":h["started"],"updated":h["updated"],"counts":h["counts"],"connection_windows":h["connection_windows"]})
+          health=Path("intake/intake-health.json")
+          if not histories and health.exists(): histories=[json.loads(health.read_text())]
+          windows=[w for h in histories for w in h["connection_windows"]]
+          ordered=sorted(windows,key=lambda w:w["attempt_started"])
+          recorded_gaps=sum(max(0,b.get("connected_at",b["attempt_started"])-a.get("ended",a["attempt_started"])) for a,b in zip(ordered,ordered[1:]))
+          sorted_errors=sorted(errors)
+          report={"ton_sale_events":len(sales),"unique_gifts":len(seen),"evaluated_unique_gifts":len(errors),"abstention_reasons":dict(holds),"median_error_pct":median(errors) if errors else None,"p90_error_pct":sorted_errors[math.ceil(.9*len(errors))-1] if errors else None,"max_error_pct":max(errors,default=None),"overestimated_more_than_15pct":over,"recorded_segments":len(histories),"connection_attempts":len(windows),"recorded_disconnects":sum(w.get("outcome")=="disconnected" for w in windows),"recorded_gap_seconds":round(recorded_gaps,2),"alerts_sent":0,"limitations":["Provider-reported sales not independently verified","Unobserved intervals cannot be replayed","Prediction error is not realized trading performance","No cost or executable listing verification"]}
+          Path("intake/day-results.json").write_text(json.dumps(report,indent=2))
+          print("DAY_RESULTS:",json.dumps(report))
+          with open(__import__("os").environ["GITHUB_STEP_SUMMARY"],"w") as summary:
+              summary.write("# GiftRadar data validation\n\n")
+              summary.write("Reported TON sales: "+str(len(sales))+"\n\nUnique gifts: "+str(len(seen))+"\n\nResearch estimates: "+str(len(errors))+"\n\n")
+              summary.write("No opportunity alerts sent. Sales and estimates remain unverified for trading.\n")
+          PY
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: gifts-day-results
+          path: intake/
+          retention-days: 30
